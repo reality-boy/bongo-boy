@@ -1,6 +1,32 @@
 
-#include <Arduino.h>
-#include <Wire.h>
+/*
+
+B+/B- Controls:
+- volume
+- enter/exit pad assignment mode
+- adjust pad sample up/down
+- enter/exit sensitivity adjust mode
+- adjust sensitivity up/down
+- start tap-n-set metronome
+
+
+button alone adjust volume
+
+both buttons held for 1 second enters tap-n-set metronome (with ding sound on keyboard)
+ you then have 15 seconds to start taping out a rythm.
+ once you have tapped at least two, and up to 4 beats we calculate the time and start playing the ding sound
+ if more than 2x seconds have gone by without a tap we assume you are finished inputting the beat
+
+both buttons held with the up stick enters the pad assignment mode
+ tap any pad to select it as the 'active pad'
+ we apply some debounce to lock the loudest pad in the last 1/16th of a second so double pads don't cause issues
+ hitting button up/down will change the sound, playing it on the midi as it changes.  At ends we just play ding sound
+ holding both buttons for 1 second leaves the assigment mode
+ 
+both buttons and down stick enters sensitivity mode
+ Same as assignment mode but adjust sensitivity over secondary midi port
+ 
+*/
 
 /*
  Guitar Hero Wourld Tour Wii drumset to MIDI converter.
@@ -109,275 +135,78 @@
  Gnd -> WII pin 6
  A4 -> WII pin 5
  A5 -> WII pin 2
-
- //---------
- 
 */
 
-//---------------
-// MIDI device communication
+#include <Arduino.h>
+#include <Wire.h>
+#include <SoftwareSerial.h>
 
-// MIDI drum notes that may be interesting to play
-enum midiDrumNotes {
-  
-  // from my Yamaha PSR E323 keyboard
-  // starts at 13, if you are interested
-  SNARE_ROLL = 29,  // playes a roll untill key up
-  CASTANET = 30,
-  SNARE_H_SOFT = 31,
-  STICKS = 32,
-  BASE_DRUM_SOFT = 33,
-  OPEN_RIM_SHOT = 34,
-  
-  // beginning of GM standard midi sounds
-  BASE_DRUM_HARD = 35,
-  BASE_DRUM = 36,
-  SIDE_STICK = 37,
-  SNARE_M = 38,
-  HAND_CLAP = 39,
-  SNARE_H_HARD = 40,
-  FLOOR_TOM_L = 41,
-  HI_HAT_CLOSE = 42,
-  FLOOR_TOM_H = 43,
-  HI_HAT_PEDAL = 44,
-  LOW_TOM = 45,
-  HI_HAT_OPEN = 46,
-  MID_TOM_L = 47,
-  MID_TOM_H = 48,
-  CRASH_CYMBAL_1 = 49,
-  HIGH_TOM = 50,
-  RIDE_CYMBAL_1 = 51,
-  CHINESE_CYMBAL = 52,
-  RIDE_BELL = 53,
-  TAMBOURINE = 54,
-  SPLASH_CYMBAL = 55,
-  COWBELL = 56,
-  CRASH_CYMBAL_2 = 57,
-  VIBRA_SLAP = 58,
-  RIDE_CYMBAL_2 = 59,
-  // goes on to 81 if you are interested
-  // 84 for my Yamaha keyboard
+#include "bongoMIDI.h"
+#include "bongoWiiDrum.h"
+
+bongoWiiDrum drum;
+bongoMIDI MIDIOut(2, 3);
+bongoMIDI DrumConfig(4, 5);
+
+int midiVolume = 100;
+
+int padSensitivity[P_COUNT] = {58, 58, 58, 58, 58, 58};
+
+int padMIDIMap[P_COUNT] = {
+  SNARE_ROLL, //SNARE_H_HARD, // RED
+  MID_TOM_L, // BLUE
+  FLOOR_TOM_L, // GREEN
+  HI_HAT_CLOSE, // YELLOW
+  RIDE_CYMBAL_1, // ORANGE
+  BASE_DRUM_HARD, //PEDAL
 };
 
-// MIDI commands always have there high byte set
-// and are located in the upper 4 byte block
-// the lower 4 bytes are reserved for the 16 MIDI channels
-enum midiCommands {
-  NOTE_OFF = 0x80,
-  NOTE_ON = 0x90,
-  CONTROL_CHANGE = 0xB0,
-};
+int state = 0;
+int lastPad = 0;
 
-// MIDI devices support 16 communication channels so 16 devices 
-// can talk to one device.  Channel 16 is for configuration of the 
-// device and channel 10 is a special dedicated drum channel
-enum midiChannels {
-  CHAN_10 = 0x09, // drum channel
-  CHAN_16 = 0x0F, // config channel?
-};
+const unsigned long msPerMin = 60000L;
+unsigned long beatPerMin = 100L;
 
-// MIDI is simple, we just transmit out the serial port at 31250 KB
-void initMIDI()
+unsigned long msPerBeat = 4 * msPerMin / beatPerMin;
+unsigned long msPer4th = msPerMin / beatPerMin;
+unsigned long msPer8th = msPerMin / (beatPerMin * 2);
+unsigned long msPer16th = msPerMin / (beatPerMin * 4);
+
+unsigned long startBeatTime = 0L;  // when we started to play
+unsigned long nextBeat = 0L;       // when the next note will play
+
+unsigned long tapStartTime = 0;
+unsigned long tapEndTime = 0;
+unsigned long tapBeatCount = 0;
+bool tapFirstTime = true;
+
+void setBeat(int beat)
 {
-  // Setup serial port to talk over MIDI
-  Serial.begin(31250);
-}
-
-// Talking is just as simple, toss out a command (command | channel) and 
-// two data bytes and you are done.
-void transmitMIDI(int cmd, int data_1, int data_2)
-{
-  Serial.write(cmd & 0xFF);
-  Serial.write(data_1 & 0xFF);
-  Serial.write(data_2 & 0xFF);
-}
-
-//--------------
-// Wii Drums communication
-
-// use B+ button to toggle snare sound on/off
-bool isSnareOn = true;
-
-// wich pad is velocity dat for
-enum wichPad {
-  RED = 0x19,
-  BLUE = 0x0F,
-  GREEN = 0x12,
-  YELLOW = 0x11,
-  ORANGE = 0x0E,
-  PEDAL = 0x1B,
-};
-
-// index into our array of buttons
-enum buttons {
-  BRED = 0,
-  BBLUE,
-  BGREEN,
-  BYELLOW,
-  BORANGE,
-  BPEDAL,
-  BMINUS,
-  BPLUS,
-  
-  B_COUNT, // how many buttons in total are there
-};
-
-// data recieved from drum
-int sx, sy, wich, softness;
-bool isHHP, haveVel;
-bool buttons[B_COUNT];
-bool lastButtons[B_COUNT];
-
-// drums use i2c bus, but they are not much harder to talk to than MIDI
-void drumBegin()
-{
-  Wire.begin();
-
-  // first stage of wii nunchuck initialization
-  Wire.beginTransmission(0x52);
-  Wire.write(0xF0);
-  Wire.write(0x55);
-  Wire.endTransmission();
-  
-  delay(1);  
-  
-  // second stage of wii nunchuck initialization
-  Wire.beginTransmission(0x52);
-  Wire.write(0xFB);
-  Wire.write((uint8_t)0x00);
-  Wire.endTransmission();
-
-  // send zero to request a data packet form drums
-  // Important, do this before you request data or 
-  // the bytes may not alighn properly
-  Wire.beginTransmission(0x52);
-  Wire.write(0x00);
-  Wire.endTransmission();
-  
-  // zero out our last button hit array
-  memset(lastButtons, 0, sizeof(lastButtons));
-}
-
-// Data comes in in a 6 byte block.  This does not match up with 
-// the usual format for Wii nunchuck remotes.  We get one packet every
-// time any pad is hit, with the velocity data filled in.  We may also get
-// additional packets indicating the pad is active, but with no velocity
-// data. We can safely ignore those packets, unless you want to use them to
-// simulate MIDI key off.  Data is queued up, so if you don't read often enough
-// then you get latency!  I find that going much past a 10ms delay will cause
-// troubles.
-void drumReadData()
-{
-  byte values[6];
-  int count = 0;
-
-  // read 6 bytes  
-  count = 0;
-  Wire.requestFrom(0x52, 6);
-  while(Wire.available() && count < 6)
-  {
-    values[count] = Wire.read();
-    count++;
-  }
-
-  // request next packet
-  Wire.beginTransmission(0x52);
-  Wire.write((uint8_t)0x00);
-  Wire.endTransmission();
-  
-  // decode our recieved data
-  sx       = values[0] & 0x3F; // joystick x
-  sy       = values[1] & 0x3F; // joystick y
-  isHHP    = !((values[2] >> 7) & 0x01); // velocity data is actually hi-hat pedal position
-  haveVel  = !((values[2] >> 6) & 0x01); // velocity data available
-  wich     = (values[2] >> 1) & 0x1F; // what pad is velocity data for
-  softness = 7 - ((values[3] >> 5) & 0x07); // velocity data, from 0-7
-  
-  // stash off old button list so we can detect changes
-  memcpy(lastButtons, buttons, sizeof(lastButtons));
-  
-  // decode all the buttons
-  buttons[BMINUS]  = !((values[4] >> 4) & 0x01); // minus button
-  buttons[BPLUS]   = !((values[4] >> 2) & 0x01); // plus button
-  buttons[BORANGE] = !((values[5] >> 7) & 0x01); // orange pad is active
-  buttons[BRED]    = !((values[5] >> 6) & 0x01); // red pad is active
-  buttons[BYELLOW] = !((values[5] >> 5) & 0x01); // yellow pad is active
-  buttons[BGREEN]  = !((values[5] >> 4) & 0x01); // green pad is active
-  buttons[BBLUE]   = !((values[5] >> 3) & 0x01); // blue pad is active
-  buttons[BPEDAL]  = !((values[5] >> 2) & 0x01); // base pedal is active
-}
-
-// The meat of the program, we recieve drum hits, convert to MIDI notes,
-// and blast it out.
-void processMidiDrum()
-{
-  drumReadData();
-  
-  // we only recieve velocity data when a pad was hit
-  if(haveVel)
-  {
-    int note = 0;
-    int velocity = 0;
-   
-    // decode what note to play   
-    switch(wich) {
-      // pads
-      case RED:
-        if(isSnareOn)
-          note = SNARE_H_HARD;
-        else
-          note = SNARE_M;
-        break;
-        
-      case BLUE:   note = MID_TOM_L;   break;
-      case GREEN:  note = FLOOR_TOM_L;  break;
+  if(beat > 300)
+    beat = 300;
+  if(beat < 20)
+    beat = 20;
     
-      // cymbols
-      case YELLOW: 
-        if(buttons[BMINUS])
-          note = HI_HAT_OPEN;
-        else
-          note = HI_HAT_CLOSE;
-        break;
-
-      case ORANGE: note = RIDE_CYMBAL_1; break;
-
-      // one of two pedals...
-      case PEDAL:  note = BASE_DRUM_HARD;  break;
-    }
-    
-    // velocity is a value from 0-7
-    // map it to 0-127 for export to MIDI
-    velocity = 15 + (softness * 16 );
-    // make sure we don't go over 127, the high byte is reserved for control codes
-    if(velocity > 127)
-      velocity = 127;
-
-    // turn a note on, on chanel 10 (the drum channel)
-    // in principle we should turn the note back off as well but my keyboard
-    // ignores note off commands form drums and so I don't bother
-    transmitMIDI(NOTE_ON | CHAN_10, note, velocity);
-  }
+  beatPerMin = beat;
+  msPerBeat = 4 * msPerMin / beatPerMin;
+  msPer4th = msPerMin / beatPerMin;
+  msPer8th = msPerMin / (beatPerMin * 2);
+  msPer16th = msPerMin / (beatPerMin * 4);
   
-  // map hi-hat to B- button for now
-  // later map it to secondary pedal.
-  if( !buttons[BMINUS] && lastButtons[BMINUS] )
-  {
-    // I tried to transmit the high hat close sound here, but
-    // my keyboard can not play a hi-hat close sound at the same time
-    // you play a hi-hat hit sound so it just muddled up the sound
-    //transmitMIDI(NOTE_ON | CHAN_10, HI_HAT_PEDAL, 63);
-  }
-  
-  // toggle snare on/off with B+ button
-  // you could extend this to switch between two sets of sounds
-  // for all pads
-  if(buttons[BPLUS] && !lastButtons[BPLUS])
-    isSnareOn = !isSnareOn;
-
-  // don't run too fast or we overwhelm the MIDI port
-  // but don't run too slow or the drums get laggy
-  delay(10);
+  startBeatTime = millis();
+  nextBeat = startBeatTime + msPer8th;
+  Serial.print(beatPerMin);
+  Serial.print(" ");
+  Serial.print(msPerBeat);
+  Serial.print(" ");
+  Serial.print(msPer4th);
+  Serial.print(" ");
+  Serial.print(msPer8th);
+  Serial.print(" ");
+  Serial.print(msPer16th);
+  Serial.print(" ");
+  Serial.print(startBeatTime);
+  Serial.println(" ");
 }
 
 // Set sensitivity of pads through external MIDI in port on drum kit
@@ -400,12 +229,12 @@ void setDrumkitSensitivityOverMIDI(int /*wichPad*/ pad, int level)
 {
   int padNum = 0;
   switch(pad) {
-    case RED: padNum = 0x68; break;
-    case BLUE: padNum = 0x66; break;
-    case GREEN: padNum = 0x67; break;
+    case RED:    padNum = 0x68; break;
+    case BLUE:   padNum = 0x66; break;
+    case GREEN:  padNum = 0x67; break;
     case YELLOW: padNum = 0x69; break;
     case ORANGE: padNum = 0x6A; break;
-    case PEDAL: padNum = 0x64; break;
+    case PEDAL:  padNum = 0x64; break;
   }
   
   // limit range to 1-63 for sensitivity, 0 may work, but I did not test it
@@ -418,137 +247,263 @@ void setDrumkitSensitivityOverMIDI(int /*wichPad*/ pad, int level)
   level = 63 - level;
   
   if(padNum != 0)
-    transmitMIDI(CONTROL_CHANGE | CHAN_16, padNum, level);
+    DrumConfig.transmitMIDI(CONTROL_CHANGE | CHAN_16, padNum, level);
+    
+  // eat up junk data returned by drums after change in sensitivity
+  for(int i=0; i<33; i++)
+  {
+    drum.readData();
+    delay(10);
+  }
 }
 
-// A simple helper function to loop through all pads and set there sensitivity
-// Adjust this as needed
-void initSensitivity()
+void saveDrumkitSensitivityOverMIDI()
 {
-  // I believe the default sensitivity from the factory is around 32
-  // but I am not positive
-  
-  // I find that making the snare more sensitive helps with drum rolls
-  setDrumkitSensitivityOverMIDI(RED, 60);
-  setDrumkitSensitivityOverMIDI(BLUE, 55);
-  setDrumkitSensitivityOverMIDI(GREEN, 55);
-  
-  // the cymbols are poorly isolated so reduce there sensitivity (relatively)
-  setDrumkitSensitivityOverMIDI(YELLOW, 50);
-  setDrumkitSensitivityOverMIDI(ORANGE, 50);
-  
-  // my pedal worked best with high sensitivity, but then
-  // it started to play by itself, so back down it goes
-  setDrumkitSensitivityOverMIDI(PEDAL, 50);
-
   // save data permanently to eeprom
   // this call is optional, if you just want to test the sensitivity without
   // making it a permanent change
-  transmitMIDI(CONTROL_CHANGE | CHAN_16, 0x65, 0x03);
-  transmitMIDI(CONTROL_CHANGE | CHAN_16, 0x77, 0x77);
-
-  // give it a long break between tries
-  delay(1000);
+  DrumConfig.transmitMIDI(CONTROL_CHANGE | CHAN_16, 0x65, 0x03);
+  DrumConfig.transmitMIDI(CONTROL_CHANGE | CHAN_16, 0x77, 0x77);
+  
+  // eat up junk data returned by drums after change in sensitivity
+  for(int i=0; i<33; i++)
+  {
+    drum.readData();
+    delay(10);
+  }
 }
 
-// just a little debug routine to dump the drum data to the serial port
-// don't call this when using the MIDI out
-void drumDebugRead()
+void playPad(int pad, int softness)
 {
-  static byte oldValues[6] = {0};
-  byte values[6];
-  int count = 0;
+  // velocity is a value from 0-7
+  // map it to 0-127 for export to MIDI
+  int velocity = 15 + (softness * 16 );
 
-  // read 6 bytes  
-  count = 0;
-  Wire.requestFrom(0x52, 6);
-  while(Wire.available() && count < 6)
-  {
-    values[count] = Wire.read();
-    count++;
-  }
+  // make sure we don't go over 127, the high byte is reserved for control codes
+  if(velocity > 127)
+    velocity = 127;
 
-  // request next packet
-  Wire.beginTransmission(0x52);
-  Wire.write((uint8_t)0x00);
-  Wire.endTransmission();
+  int index = drum.padToButton(pad);
   
-  if(0 != memcmp(oldValues, values, sizeof(oldValues)) &&
-    (values[2] != 0xFF || values[3] != 0xFF || values[4] != 0xFF || values[5] != 0xFF))
+  int chan = CHAN_10;
+
+  // turn a note on, on chanel 10 (the drum channel)
+  MIDIOut.transmitMIDI(NOTE_ON | CHAN_10, padMIDIMap[index], velocity);
+  delay(5);
+  MIDIOut.transmitMIDI(NOTE_OFF | CHAN_10, padMIDIMap[index], 127); // 127 indicates fastest decay
+}
+
+int increment(int val, int min, int max, int inc)
+{
+  val += inc;
+  if(val > max)
+    val = max;
+  if(val < min)
+    val = min;
+  return val;
+}
+
+// The meat of the program, we recieve drum hits, convert to MIDI notes,
+// and blast it out.
+void processMidiDrum()
+{
+  // we only recieve velocity data when a pad was hit
+  if(drum.haveVel)
+    playPad(drum.wich, drum.softness);
+  
+  // save off last pad hit for later use
+  if(drum.buttonDown(BDOWN) && drum.haveVel)
   {
-    //Serial.print(values[0], HEX);
-    //Serial.print(' ');
-    //Serial.print(values[1], HEX);
-    //Serial.print(' ');
-    Serial.print(values[2], BIN);
-    Serial.print(' ');
-    Serial.print(values[3], BIN);
-    Serial.print(' ');
-    Serial.print(values[4], BIN);
-    Serial.print(' ');
-    Serial.print(values[5], BIN);
-    Serial.print(' ');
+    state = 1;
+    lastPad = drum.wich;
     
-    bool haveVel = !((values[2] >> 6) & 0x01); // velocity data available
-    int wich     =   (values[2] >> 1) & 0x1F; // what pad is velocity data for
-    int softness = 7 - ((values[3] >> 5) & 0x07); // velocity data, from 0-7
+    // set the sensitivity, just in case it has not been set yet...
+    int index = drum.padToButton(lastPad);
+    setDrumkitSensitivityOverMIDI(lastPad, padSensitivity[index]);
+
+    Serial.print("State 1: Set pad sensitivity ");
+    Serial.print("Pad ");
+    Serial.print(drum.padToString(lastPad));
+    Serial.print(" Sensitivity ");
+    Serial.println(padSensitivity[index]);
+  }
+  else if(drum.buttonDown(BUP) && drum.haveVel)
+  {
+    state = 2;
+    lastPad = drum.wich;
     
-    if(haveVel)
+    int index = drum.padToButton(lastPad);
+
+    Serial.print("State 2: Set MIDI note ");
+    Serial.print("Pad ");
+    Serial.print(drum.padToString(lastPad));
+    Serial.print(" MIDI Note ");
+    Serial.println(padMIDIMap[index]);
+  }
+  else if(drum.buttonDown(BLEFT) && drum.haveVel)
+  {
+    if(tapFirstTime)
     {
-      Serial.print("vel ");
-      Serial.print(wich, HEX);
-      Serial.print(' ');
-      Serial.print(softness);
-      Serial.print(' ');
-    }
+      tapFirstTime = false;
+      tapStartTime = millis();
+      tapEndTime = tapStartTime;
+      tapBeatCount = 0;
+      state = 3;
+      lastPad = drum.wich;
+      nextBeat = 0xFFFFFFFFL;
 
-    Serial.println("");
+      Serial.print("State 3: Play rythm ");
+      Serial.print("Pad ");
+      Serial.println(drum.padToString(lastPad));
+    }
+    else
+    {
+      tapEndTime = millis();
+      tapBeatCount++;
+    }
   }
-  memcpy(oldValues, values, sizeof(oldValues));
+  else if(state == 3 && !drum.buttonDown(BLEFT) && !tapFirstTime)
+  {
+    tapFirstTime = true;
+
+    if(tapBeatCount > 0)
+    {
+      unsigned long tapTime = (tapEndTime - tapStartTime) / tapBeatCount;
+      unsigned long beat = msPerMin / tapTime;
+      setBeat(beat);
+      
+      Serial.print("bpm ");
+      Serial.println(beat);
+    }
+  }
+
+  // release state
+  if(drum.buttonDown(BPLUS) && drum.buttonDown(BMINUS))
+  {
+    if(state != 0)
+    {
+      if(state == 1)
+      {
+        saveDrumkitSensitivityOverMIDI();
+        Serial.println("saving sensitivity permanently");
+      }
+    
+      state = 0;
+      Serial.println("State 0: Normal ");
+    }
+  }
+
+  if(drum.buttonPressed(BPLUS) || drum.buttonPressed(BMINUS))
+  {
+    if(state == 0)
+    {
+      if(drum.buttonPressed(BPLUS))
+        midiVolume = increment(midiVolume, 1, 127, 8);
+      else
+        midiVolume = increment(midiVolume, 1, 127, -8);
   
-  delay(10);
+      // Set the channel volume
+      MIDIOut.transmitMIDI(CONTROL_CHANGE | CHAN_10, CHANNEL_VOLUME, midiVolume);
+      //delay(1);
+      playPad(RED, 1);
+
+      Serial.print("Volume ");
+      Serial.println(midiVolume);
+    }
+    else if(state == 1)
+    {
+      int index = drum.padToButton(lastPad);
+  
+      if(drum.buttonPressed(BPLUS))
+        padSensitivity[index] = increment(padSensitivity[index], 1, 62, 1);
+      else
+        padSensitivity[index] = increment(padSensitivity[index], 1, 62, -1);
+    
+      setDrumkitSensitivityOverMIDI(lastPad, padSensitivity[index]);
+  
+      Serial.print("Pad ");
+      Serial.print(drum.padToString(lastPad));
+      Serial.print(" Sensitivity ");
+      Serial.println(padSensitivity[index]);
+    }
+    else if(state == 2)
+    {
+      int index = drum.padToButton(lastPad);
+  
+      if(drum.buttonPressed(BPLUS))
+        padMIDIMap[index] = increment(padMIDIMap[index], 0, 127, 1);
+      else
+        padMIDIMap[index] = increment(padMIDIMap[index], 0, 127, -1);
+
+      playPad(lastPad, 1);
+      
+      Serial.print("Pad ");
+      Serial.print(drum.padToString(lastPad));
+      Serial.print(" MIDI Note ");
+      Serial.println(padMIDIMap[index]);
+    }
+  }
+  
+  if(state == 3)
+  {
+    unsigned long currMillis = millis();
+    if(currMillis >= nextBeat)
+    {
+      unsigned long beatCount = (currMillis - startBeatTime) / msPer8th;
+      unsigned long currBeat = beatCount % 8;
+        
+      playPad(YELLOW, 1);
+      
+      /*
+      if(currBeat == 0 || currBeat == 4)
+        playPad(PEDAL, 1);
+        
+      if(currBeat == 2 || currBeat == 6)
+        playPad(RED, 1);
+      
+      Serial.print("Play beat ");
+      Serial.print(" ");
+      Serial.print(currBeat);
+      Serial.print(" ");
+      Serial.print(beatCount);
+      Serial.print(" ");
+      Serial.print(currMillis);
+      Serial.print(" ");
+      Serial.print(currMillis - nextBeat);
+      Serial.println(" ");
+      */
+      
+      nextBeat = startBeatTime + ((beatCount + 1) * msPer8th);
+    }
+  }
+
+  // don't run too fast or we overwhelm the MIDI port
+  // but don't run too slow or the drums get laggy
+  delay(5);
 }
 
 void setup()
 {
-  // setup MIDI
-  initMIDI();
+  // init serial port for debugging
+  Serial.begin(57600);
+
+  // setup MIDI output
+  MIDIOut.begin();
   
-  // setup drum controller
-  drumBegin();
-  
+  // setup MIDI communication with drum pads
+  DrumConfig.begin();
+
+  // setup drum controller reader
+  drum.begin();
 }
 
 void loop()
 {
-  // change this to pick our opperating mode
-  int mode = 0;
-  
-  switch(mode) {
-  case 0:
-    // normally we are a drum...
-    processMidiDrum();
-    break;
-    
-  case 1:
-    // but if you enable this function and
-    // hook the MIDI cable directly into the Guitar hero drum kit
-    // then we can adjust the pad sensitivity
-    // I'm not sure how safe this is to blast to a standard midi
-    // device, so I made it a compile option...
-    initSensitivity();
-    break;
-  
-  case 2:
-    // dump debug data to serial port
-    static bool needsInit = true;
-    if(needsInit)
-    {
-      Serial.begin(57600);
-      needsInit = false;
-    }
+  drum.readData();
 
-    drumDebugRead();
-    break;
-  }
+  // normally we are a drum...
+  processMidiDrum();
+  
+  // dump debug info to serial
+  drum.dumpToSerial();
 }
