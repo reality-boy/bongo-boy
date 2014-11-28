@@ -1,6 +1,22 @@
+/*
+ We have 6 inputs: 3 drum pads (red, blue, green), two cymbals (yellow, orange), a foot pedal,
+ two buttons (plus and minus), and a 4 way stick.
+ We would like to have 5 drums (snare, 2 hanging toms, floor tom, base drum), and 3 cymbals (crash, ride, and hi-hat with pedal)
+ 6 inputs and 8 outputs is too much to deal with, we can reuse the +/- buttons but they are too hard to 
+ reach and the hi-hat makes at least 4 sounds all by itself (pedal click, closed, partly open and fully open)
+ However if we add in a second pedal that has two sensors in it we can use it to fill in some of the gaps.
+ If we have a velocity sensor in the pedal we can play the hi-hat 'click' sound, and if we have a position sensor
+ we can use it to choose what sounds to assign to the left hand cymbal.  Ranging from a hi-hat closed click, to partially opened
+ and finaly to a crash cymbal when fully opened.  It may be possible to use the position sensor to calculate velocity and
+ dispense with the force sensor all together in the pedal.
+ We still have to choose between a floor tom and a second hanging tom but we can't have everything!
+ 
+ If we set things up right then the hi-hat will sound good even if we don't have the pedal plugged in...
+ 
+ In addition we could add in our own circuit to deal with the base pedal in order to get more expression out of it.
+*/
 
 /*
-
 B+/B- Controls:
 - volume
 - enter/exit pad assignment mode
@@ -8,7 +24,6 @@ B+/B- Controls:
 - enter/exit sensitivity adjust mode
 - adjust sensitivity up/down
 - start tap-n-set metronome
-
 
 button alone adjust volume
 
@@ -25,7 +40,6 @@ both buttons held with the up stick enters the pad assignment mode
  
 both buttons and down stick enters sensitivity mode
  Same as assignment mode but adjust sensitivity over secondary midi port
- 
 */
 
 /*
@@ -137,32 +151,59 @@ both buttons and down stick enters sensitivity mode
  A5 -> WII pin 2
 */
 
+/*
+ We added in two new features, a switch that can be triggered to change the sound on one pad
+ and a new class that can directly read a pieazo element to allow for new pads to be attached
+ to the drums.  
+
+ I modified a drum pedal with piezo element by adding in a switch to it.  This pedal will represent
+ the high hat pedal, the switch will select an open and closed high hat sound when hitting the yellow
+ cymbol, and the pedal will play the high hat closing sound based on how hard you press on the pedal.
+
+ In addition I am wiring in an aditional pair of piezo speakers so that you can plug in a home made
+ drum to simulate the snare drum.  One piezo will play the pad, and the other will be wired to the rim
+ so you can make rim shots.
+
+ The pedal switch hooks to pin D6 with a 1K pullup resistor and the pin wired to ground when closed.
+ The pads wire the positive terminal on the piezo to A1 to A3 with a 1000 K resistor to ground and the
+ negative pin tied to ground.
+*/
+
 #include <Arduino.h>
 #include <Wire.h>
 #include <SoftwareSerial.h>
 
 #include "bongoMIDI.h"
 #include "bongoWiiDrum.h"
+#include "bongoPiezoDrum.h"
 
+int switchPin = 6;
 bongoWiiDrum drum;
 bongoMIDI MIDIOut(2, 3);
 bongoMIDI DrumConfig(4, 5);
+bongoPiezoDrum pedal(A1);
+bongoPiezoDrum snare(A2);
+bongoPiezoDrum rim(A3);
 
 int midiVolume = 100;
 
-int padSensitivity[P_COUNT] = {58, 58, 58, 58, 58, 58};
+int padSensitivity[P_COUNT] = {58, 58, 58, 58, 58, 58, 58, 58, 58, 58};
 
 int padMIDIMap[P_COUNT] = {
-  SNARE_ROLL, //SNARE_H_HARD, // RED
-  MID_TOM_L, // BLUE
-  FLOOR_TOM_L, // GREEN
-  HI_HAT_CLOSE, // YELLOW
-  RIDE_CYMBAL_1, // ORANGE
-  BASE_DRUM_HARD, //PEDAL
+  SNARE_M,		// RED
+  MID_TOM_L, 		// BLUE
+  FLOOR_TOM_L,		// GREEN
+  HI_HAT_OPEN, 	        // YELLOW
+  RIDE_CYMBAL_1, 	// ORANGE
+  BASE_DRUM,		// PEDAL
+  HI_HAT_CLOSE,		// YELLOW_SWITCH
+  HI_HAT_PEDAL,		// EXT_DRM_1
+  SNARE_M,		// EXT_DRM_2
+  SIDE_STICK,		// EXT_DRM_3
 };
 
 int state = 0;
-int lastPad = 0;
+wichPad lastPad = RED;
 
 const unsigned long msPerMin = 60000L;
 unsigned long beatPerMin = 100L;
@@ -225,7 +266,7 @@ void setBeat(int beat)
 // help bring down the upper limit on velocity so you don't have to waill as hard
 // to register the maximum force on the pads.  Note that I have not yet tested
 // this idea out, and you run a real risk of breaking your kit if you try it.
-void setDrumkitSensitivityOverMIDI(int /*wichPad*/ pad, int level)
+void setDrumkitSensitivityOverMIDI(wichPad pad, int level)
 {
   int padNum = 0;
   switch(pad) {
@@ -235,10 +276,11 @@ void setDrumkitSensitivityOverMIDI(int /*wichPad*/ pad, int level)
     case YELLOW: padNum = 0x69; break;
     case ORANGE: padNum = 0x6A; break;
     case PEDAL:  padNum = 0x64; break;
+    default: return;
   }
   
   // limit range to 1-63 for sensitivity, 0 may work, but I did not test it
-  if(level < 1)
+  if(level < 2)
     level = 1;
   if(level > 63)
     level = 63;
@@ -273,24 +315,29 @@ void saveDrumkitSensitivityOverMIDI()
   }
 }
 
-void playPad(int pad, int softness)
+void playPad(wichPad pad, int velocity)
 {
-  // velocity is a value from 0-7
-  // map it to 0-127 for export to MIDI
-  int velocity = 15 + (softness * 16 );
+  if(velocity <= 0)
+    velocity = 0; // return;
 
   // make sure we don't go over 127, the high byte is reserved for control codes
   if(velocity > 127)
     velocity = 127;
 
-  int index = drum.padToButton(pad);
-  
   int chan = CHAN_10;
 
   // turn a note on, on chanel 10 (the drum channel)
-  MIDIOut.transmitMIDI(NOTE_ON | CHAN_10, padMIDIMap[index], velocity);
+  MIDIOut.transmitMIDI(NOTE_ON | CHAN_10, padMIDIMap[pad], velocity);
   delay(5);
-  MIDIOut.transmitMIDI(NOTE_OFF | CHAN_10, padMIDIMap[index], 127); // 127 indicates fastest decay
+  MIDIOut.transmitMIDI(NOTE_OFF | CHAN_10, padMIDIMap[pad], 127); // 127 indicates fastest decay
+  
+  Serial.print("play pad ");
+  Serial.print(drum.padToString(pad));
+  Serial.print(" ");
+  Serial.print(velocity);
+  Serial.print(" ");
+  Serial.print(padMIDIMap[pad]);
+  Serial.println();
 }
 
 int increment(int val, int min, int max, int inc)
@@ -309,36 +356,64 @@ void processMidiDrum()
 {
   // we only recieve velocity data when a pad was hit
   if(drum.haveVel)
-    playPad(drum.wich, drum.softness);
+  {
+    lastPad = drum.getPad();
+
+    // read optional switch on hihat pedal
+    int hihatSwitch = digitalRead(switchPin);
+
+    // optional switch in hi-hat pedal selects different hi hat sound
+    if(lastPad == YELLOW && hihatSwitch)
+       lastPad = YELLOW_SWITCH;
+
+    // velocity is a value from 0-7
+    // map it to 0-127 for export to MIDI
+    int velocity = 15 + (drum.softness * 16 );
+
+    playPad(lastPad, velocity);
+  }
+  else if(pedal.getHit(false) > 0)
+  {
+    lastPad = EXT_DRM_1;
+    int velocity =  (int)(pedal.getHit(true) * 2 * 127.0 / 1024.0);
+    playPad(lastPad, velocity);
+  }
+  else if(snare.getHit(false) > 0)
+  {
+    lastPad = EXT_DRM_2;
+    int velocity =  (int)(snare.getHit(true) * 2 * 127.0 / 1024.0);
+    playPad(lastPad, velocity);
+  }
+  else if(rim.getHit(false) > 0)
+  {
+    lastPad = EXT_DRM_3;
+    int velocity =  (int)(rim.getHit(true) * 2 * 127.0 / 1024.0);
+    playPad(lastPad, velocity);
+  }
   
   // save off last pad hit for later use
   if(drum.buttonDown(BDOWN) && drum.haveVel)
   {
     state = 1;
-    lastPad = drum.wich;
     
     // set the sensitivity, just in case it has not been set yet...
-    int index = drum.padToButton(lastPad);
-    setDrumkitSensitivityOverMIDI(lastPad, padSensitivity[index]);
+    setDrumkitSensitivityOverMIDI(lastPad, padSensitivity[lastPad]);
 
     Serial.print("State 1: Set pad sensitivity ");
     Serial.print("Pad ");
     Serial.print(drum.padToString(lastPad));
     Serial.print(" Sensitivity ");
-    Serial.println(padSensitivity[index]);
+    Serial.println(padSensitivity[lastPad]);
   }
   else if(drum.buttonDown(BUP) && drum.haveVel)
   {
     state = 2;
-    lastPad = drum.wich;
     
-    int index = drum.padToButton(lastPad);
-
     Serial.print("State 2: Set MIDI note ");
     Serial.print("Pad ");
     Serial.print(drum.padToString(lastPad));
     Serial.print(" MIDI Note ");
-    Serial.println(padMIDIMap[index]);
+    Serial.println(padMIDIMap[lastPad]);
   }
   else if(drum.buttonDown(BLEFT) && drum.haveVel)
   {
@@ -349,7 +424,6 @@ void processMidiDrum()
       tapEndTime = tapStartTime;
       tapBeatCount = 0;
       state = 3;
-      lastPad = drum.wich;
       nextBeat = 0xFFFFFFFFL;
 
       Serial.print("State 3: Play rythm ");
@@ -405,42 +479,38 @@ void processMidiDrum()
       // Set the channel volume
       MIDIOut.transmitMIDI(CONTROL_CHANGE | CHAN_10, CHANNEL_VOLUME, midiVolume);
       //delay(1);
-      playPad(RED, 1);
+      playPad(RED, 31);
 
       Serial.print("Volume ");
       Serial.println(midiVolume);
     }
     else if(state == 1)
     {
-      int index = drum.padToButton(lastPad);
-  
       if(drum.buttonPressed(BPLUS))
-        padSensitivity[index] = increment(padSensitivity[index], 1, 62, 1);
+        padSensitivity[lastPad] = increment(padSensitivity[lastPad], 1, 62, 1);
       else
-        padSensitivity[index] = increment(padSensitivity[index], 1, 62, -1);
+        padSensitivity[lastPad] = increment(padSensitivity[lastPad], 1, 62, -1);
     
-      setDrumkitSensitivityOverMIDI(lastPad, padSensitivity[index]);
+      setDrumkitSensitivityOverMIDI(lastPad, padSensitivity[lastPad]);
   
       Serial.print("Pad ");
       Serial.print(drum.padToString(lastPad));
       Serial.print(" Sensitivity ");
-      Serial.println(padSensitivity[index]);
+      Serial.println(padSensitivity[lastPad]);
     }
     else if(state == 2)
     {
-      int index = drum.padToButton(lastPad);
-  
       if(drum.buttonPressed(BPLUS))
-        padMIDIMap[index] = increment(padMIDIMap[index], 0, 127, 1);
+        padMIDIMap[lastPad] = increment(padMIDIMap[lastPad], 0, 127, 1);
       else
-        padMIDIMap[index] = increment(padMIDIMap[index], 0, 127, -1);
+        padMIDIMap[lastPad] = increment(padMIDIMap[lastPad], 0, 127, -1);
 
-      playPad(lastPad, 1);
+      playPad(lastPad, 31);
       
       Serial.print("Pad ");
       Serial.print(drum.padToString(lastPad));
       Serial.print(" MIDI Note ");
-      Serial.println(padMIDIMap[index]);
+      Serial.println(padMIDIMap[lastPad]);
     }
   }
   
@@ -452,14 +522,14 @@ void processMidiDrum()
       unsigned long beatCount = (currMillis - startBeatTime) / msPer8th;
       unsigned long currBeat = beatCount % 8;
         
-      playPad(YELLOW, 1);
+      playPad(YELLOW, 31);
       
       /*
       if(currBeat == 0 || currBeat == 4)
-        playPad(PEDAL, 1);
+        playPad(PEDAL, 31);
         
       if(currBeat == 2 || currBeat == 6)
-        playPad(RED, 1);
+        playPad(RED, 31);
       
       Serial.print("Play beat ");
       Serial.print(" ");
@@ -487,6 +557,9 @@ void setup()
   // init serial port for debugging
   Serial.begin(57600);
 
+  // setup hi-hat open/close switch
+  pinMode(switchPin, INPUT);
+
   // setup MIDI output
   MIDIOut.begin();
   
@@ -501,6 +574,10 @@ void loop()
 {
   drum.readData();
 
+  pedal.process();
+  snare.process();
+  rim.process();
+  
   // normally we are a drum...
   processMidiDrum();
   

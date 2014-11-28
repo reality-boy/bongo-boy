@@ -30,20 +30,8 @@
   A5 -> WII pin 2
 */
 
-// wich pad is velocity dat for
-typedef enum wichPad {
-  RED = 0x19,
-  BLUE = 0x0F,
-  GREEN = 0x12,
-  YELLOW = 0x11,
-  ORANGE = 0x0E,
-  PEDAL = 0x1B,
-  
-  P_COUNT, // how many pads
-} wichPad;
-
 // index into our array of buttons
-typedef enum buttons {
+typedef enum wichButton {
   BRED = 0,
   BBLUE,
   BGREEN,
@@ -60,7 +48,24 @@ typedef enum buttons {
   BRIGHT,
   
   B_COUNT, // how many buttons in total are there
-} buttons;
+} wichButton;
+
+typedef enum wichPad {
+  RED = 0,
+  BLUE,
+  GREEN,
+  YELLOW,
+  ORANGE,
+  PEDAL,
+  
+  YELLOW_SWITCH,
+
+  EXT_DRM_1,
+  EXT_DRM_2,
+  EXT_DRM_3,
+
+  P_COUNT, // how many buttons in total are there
+} wichPad;
 
 class bongoWiiDrum
 {
@@ -68,10 +73,23 @@ public:
   bongoWiiDrum() {}
 
   // data recieved from drum
-  int sx, sy, wich, softness;
+  int sx, sy, softness;
   bool isHHP, haveVel;
   
 private:
+  // wich pad is velocity dat for
+  typedef enum wichPad_internal {
+    PRED = 0x19,
+    PBLUE = 0x0F,
+    PGREEN = 0x12,
+    PYELLOW = 0x11,
+    PORANGE = 0x0E,
+    PPEDAL = 0x1B,
+  
+    PI_COUNT, // how many pads
+  } wichPad_internal;
+
+  wichPad wich;
   bool buttons[B_COUNT];
   bool lastButtons[B_COUNT];
 
@@ -145,7 +163,7 @@ public:
     sy       = rawBytes[1] & 0x3F; // joystick y
     isHHP    = !((rawBytes[2] >> 7) & 0x01); // velocity data is actually hi-hat pedal position
     haveVel  = !((rawBytes[2] >> 6) & 0x01); // velocity data available
-    wich     = (rawBytes[2] >> 1) & 0x1F; // what pad is velocity data for
+    wich     = internalToPad((wichPad_internal)((rawBytes[2] >> 1) & 0x1F)); // what pad is velocity data for
     softness = 7 - ((rawBytes[3] >> 5) & 0x07); // velocity data, from 0-7
   
     // stash off old button list so we can detect changes
@@ -168,7 +186,7 @@ public:
   }
   
   // just pressed
-  bool buttonPressed(int b)
+  bool buttonPressed(wichButton b)
   {
     if(b >= 0 && b < B_COUNT)
       return buttons[b] && !lastButtons[b];
@@ -177,7 +195,7 @@ public:
   }
   
   // just released
-  bool buttonReleased(int b)
+  bool buttonReleased(wichButton b)
   {
     if(b >= 0 && b < B_COUNT)
       return !buttons[b] && lastButtons[b];
@@ -186,37 +204,55 @@ public:
   }
   
   // held down
-  bool buttonDown(int b)
+  bool buttonDown(wichButton b)
   {
     if(b >= 0 && b < B_COUNT)
       return buttons[b];
 
     return false;
   }
-  
-  int padToButton(int pad)
+
+  wichPad getPad()
   {
-    switch(pad) {
-    case RED:    return BRED;    break;
-    case BLUE:   return BBLUE;   break;
-    case GREEN:  return BGREEN;  break;
-    case YELLOW: return BYELLOW; break;
-    case ORANGE: return BORANGE; break;
-    case PEDAL:  return BPEDAL;  break;
-    }
-    
-    return 0;
+    return wich;
   }
   
-  const char * padToString(int pad)
+  const char * buttonToString(wichButton button) 
   {
-    switch(pad) {
-    case RED:    return "RED";    break;
-    case BLUE:   return "BLUE";   break;
-    case GREEN:  return "GREEN";  break;
-    case YELLOW: return "YELLOW"; break;
-    case ORANGE: return "ORANGE"; break;
-    case PEDAL:  return "PEDAL";  break;
+    switch(button) 
+    {
+      case BRED:    return "RED";    break;
+      case BBLUE:   return "BLUE";   break;
+      case BGREEN:  return "GREEN";  break;
+      case BYELLOW: return "YELLOW"; break;
+      case BORANGE: return "ORANGE"; break;
+      case BPEDAL:  return "PEDAL";  break;
+      case BMINUS:  return "MINUS";  break;
+      case BPLUS:   return "PLUS";   break;
+      case BUP:     return "UP";     break;
+      case BDOWN:   return "DOWN";   break;
+      case BLEFT:   return "LEFT";   break;
+      case BRIGHT:  return "RIGHT";  break;
+    }
+    
+    return "Unknown";
+  }
+
+  const char * padToString(wichPad pad) 
+  {
+    switch(pad) 
+    {
+      case RED:    return "RED";    break;
+      case BLUE:   return "BLUE";   break;
+      case GREEN:  return "GREEN";  break;
+      case YELLOW: return "YELLOW"; break;
+      case ORANGE: return "ORANGE"; break;
+      case PEDAL:  return "PEDAL";  break;
+      // not wii drum pads...
+      case YELLOW_SWITCH: return "YELLOW_SWITCH"; break;
+      case EXT_DRM_1: return "EXT_DRM_1"; break;
+      case EXT_DRM_2: return "EXT_DRM_2"; break;
+      case EXT_DRM_3: return "EXT_DRM_3"; break;
     }
     
     return "Unknown";
@@ -257,6 +293,22 @@ public:
       }
     }
   }
+
+private:
+  wichPad internalToPad(bongoWiiDrum::wichPad_internal pad_internal)
+  {
+    switch(pad_internal) {
+    case PRED:    return RED;    break;
+    case PBLUE:   return BLUE;   break;
+    case PGREEN:  return GREEN;  break;
+    case PYELLOW: return YELLOW; break;
+    case PORANGE: return ORANGE; break;
+    case PPEDAL:  return PEDAL;  break;
+    }
+    
+    return RED;
+  }
 };
 
 #endif // BONGOWIIDRUM_H
+
