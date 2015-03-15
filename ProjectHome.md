@@ -1,0 +1,1 @@
+A little Arduino sketch that lets you convert your Guitar Hero World Tour drums for the Wii into a stand alone MIDI drum set, without modifying the hardware or using a computer as a translator.
